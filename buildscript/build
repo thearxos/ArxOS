@@ -458,6 +458,9 @@ PROBLEMATIC_PACKAGES=(
     qt5-virtualkeyboard
     qt5-wayland
 
+    # —— Conflicting packages (file conflicts with other packages) ——
+    python2-coloredlogs    # conflicts with python-coloredlogs over /usr/bin/coloredlogs
+
     # —— Build-breaking (missing sources / broken) ——
     arybo
     osrframework
@@ -597,6 +600,25 @@ if [ -d /etc/systemd/system ]; then
     sudo cp -r /etc/systemd/system/*.target airootfs/etc/systemd/system/ 2>/dev/null || true
     SERVICE_COUNT=$(find airootfs/etc/systemd/system -name "*.service" | wc -l)
     log_info "Copied $SERVICE_COUNT custom services"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FIX: Remove service files that ALSO exist inside packages.
+    # When mkarchiso installs libsdrplay/torctl, they try to place their
+    # .service files at the same paths we just copied → "conflicting files" error.
+    # Solution: delete them here so the packages can install them cleanly.
+    # ═══════════════════════════════════════════════════════════════════════════
+    log_info "Removing service files that conflict with package installations..."
+    CONFLICTING_SERVICES=(
+        "sdrplay.service"               # owned by libsdrplay package
+        "torctl-autostart.service"      # owned by torctl package
+        "torctl-autowipe.service"       # owned by torctl package
+    )
+    for svc in "${CONFLICTING_SERVICES[@]}"; do
+        if [ -f "airootfs/etc/systemd/system/$svc" ]; then
+            rm -f "airootfs/etc/systemd/system/$svc"
+            log_warn "Removed conflicting: $svc (will be installed by package)"
+        fi
+    done
 fi
 
 mkdir -p airootfs/etc/systemd/system/multi-user.target.wants
@@ -1130,17 +1152,82 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRE-BUILD: Final conflict sweep
+# Remove any files in airootfs that conflict with files owned by packages.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Running pre-build conflict sweep..."
+CONFLICT_FILES=(
+    "airootfs/etc/systemd/system/sdrplay.service"
+    "airootfs/etc/systemd/system/torctl-autostart.service"
+    "airootfs/etc/systemd/system/torctl-autowipe.service"
+    "airootfs/usr/bin/coloredlogs"
+)
+SWEEP_COUNT=0
+for cf in "${CONFLICT_FILES[@]}"; do
+    if [ -e "$cf" ]; then
+        rm -f "$cf"
+        log_warn "Pre-build sweep removed: $cf"
+        ((SWEEP_COUNT++)) || true
+    fi
+done
+if [ "$SWEEP_COUNT" -eq 0 ]; then
+    log_info "No conflicting files found — clean build"
+else
+    log_warn "Removed $SWEEP_COUNT conflicting files before build"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL FIX: Patch /usr/bin/pacman temporarily during build
+#
+# WHY: python2-coloredlogs is a DEPENDENCY of a BlackArch tool, so even
+#      after removing it from packages.x86_64, pacman's dependency resolver
+#      pulls it back in. Both python-coloredlogs and python2-coloredlogs
+#      install /usr/bin/coloredlogs → file conflict → build fails.
+#
+#      The PACMAN env var approach doesn't work because sudo strips
+#      environment variables before mkarchiso/pacstrap can see them.
+#
+# FIX: Temporarily move the real pacman binary aside and replace it with
+#      a wrapper that injects --overwrite '*' into every pacman call.
+#      This is restored immediately after mkarchiso finishes.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Installing pacman overwrite wrapper (temporary)..."
+sudo cp /usr/bin/pacman /usr/bin/pacman.arxos.real
+sudo tee /usr/bin/pacman > /dev/null << 'WRAPPER'
+#!/bin/bash
+# Temporary ArxOS build wrapper — auto-overwrite conflicting files
+# This will be restored to the real pacman after build completes.
+exec /usr/bin/pacman.arxos.real --overwrite '*' "$@"
+WRAPPER
+sudo chmod 755 /usr/bin/pacman
+log_info "  ✓ pacman wrapper active (--overwrite '*' on all calls)"
+
+# Safety: ensure we ALWAYS restore pacman even if build fails
+restore_pacman() {
+    if [ -f /usr/bin/pacman.arxos.real ]; then
+        sudo mv /usr/bin/pacman.arxos.real /usr/bin/pacman
+        echo -e "  ${GREEN}✓${NC} Original pacman binary restored"
+    fi
+}
+trap restore_pacman EXIT
+
 log_info "Starting mkarchiso..."
 echo ""
 echo -e "${YELLOW}Building ISO... Progress will be shown below${NC}"
 echo ""
 
 sudo mkarchiso -v -w work -o "$OUTPUT_DIR" .
+BUILD_EXIT=$?
 
-if [ $? -eq 0 ]; then
+# Restore real pacman immediately (trap will also catch this, but be explicit)
+restore_pacman
+trap - EXIT
+
+if [ $BUILD_EXIT -eq 0 ]; then
     log_info "ISO build completed successfully!"
 else
-    log_error "ISO build failed!"
+    log_error "ISO build failed! (exit code: $BUILD_EXIT)"
     exit 1
 fi
 
