@@ -1,0 +1,1202 @@
+#!/bin/bash
+###############################################################################
+#                                                                             #
+#                    ArxOS v2026.2 ~ Mars ISO Builder                         #
+#                  Complete System Replica + ArxOS Branding                   #
+#                                                                             #
+#             Built for: 4rx0s (ArchBANG + BlackArch + XFCE4)                 #
+#                                                                             #
+#  FIX: Uses SOURCE-BUILT Calamares 3.4.1 (Qt6) — no plasma-framework dep    #
+#       Binary copied directly from ~/calamares/build into ISO airootfs       #
+#                                                                             #
+###############################################################################
+
+set -e  # Exit on error
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+# Configuration from system profile
+ARXOS_VERSION="v2026.2"
+ARXOS_CODENAME="Mars"
+ISO_NAME="arxos"
+ISO_LABEL="ARXOS"
+ISO_PUBLISHER="ArxOS - $ARXOS_VERSION ~ $ARXOS_CODENAME"
+ISO_APPLICATION="ArxOS - $ARXOS_VERSION ~ $ARXOS_CODENAME"
+WEBSITE="https://thearxos.github.io"
+GITHUB="https://github.com/thearxos"
+
+# Paths
+BUILD_DIR="$HOME/alci-iso-lts"
+OUTPUT_DIR="$HOME/ArxOS-ISOs"
+ARXOS_LOGO="$HOME/Downloads/icons/ARXOS.png"
+CUSTOMREPO_DIR="$HOME/customrepo"
+WALLPAPER_DIR="$HOME/Pictures/Wallpapers"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCE-BUILT CALAMARES PATHS
+# Built from https://codeberg.org/Calamares/calamares.git (Qt6, v3.4.1)
+# No plasma-framework dependency — this is the permanent fix.
+# ═══════════════════════════════════════════════════════════════════════════════
+CALAMARES_BIN="/usr/bin/calamares"
+CALAMARES_LIB="/usr/lib/calamares"
+CALAMARES_SHARE="/usr/share/calamares"
+
+# System profile
+DESKTOP_ENV="xfce4"
+DISPLAY_MANAGER="sddm"
+SDDM_THEME="silent"
+GTK_THEME="adw-gtk3-dark"
+PLANK_LAUNCHERS=7
+BLACKARCH_TOOLS=2840
+
+echo -e "${MAGENTA}"
+cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║              ArxOS v2026.2 ~ Mars Builder                    ║
+║         Complete XFCE4 System Replica + Branding             ║
+║                                                              ║
+║  • Desktop: XFCE 4.20.2                                      ║
+║  • Display Manager: SDDM (silent theme)                      ║
+║  • Dock: Plank (7 launchers)                                 ║
+║  • Themes: 54 custom Reversal themes                         ║
+║  • BlackArch: 2,840 security tools                           ║
+║  • Calamares: Source-built 3.4.1 (Qt6)                       ║
+║  • Custom Scripts: 9 tools + WallPimp                        ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+EOF
+echo -e "${NC}"
+
+###############################################################################
+# Helper Functions
+###############################################################################
+log_step() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}$1${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+}
+
+log_info() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+###############################################################################
+# Package Validation Function
+###############################################################################
+validate_package_list() {
+    local PKG_FILE="$1"
+    local AVAILABLE_PKGS CLEANED_PKGS REMOVED_PKGS
+    AVAILABLE_PKGS=$(mktemp /tmp/arxos-avail.XXXXXX)
+    CLEANED_PKGS=$(mktemp /tmp/arxos-clean.XXXXXX)
+    REMOVED_PKGS=$(mktemp /tmp/arxos-removed.XXXXXX)
+
+    echo "  Syncing package databases..."
+    sudo pacman --config "$BUILD_DIR/archiso/pacman.conf" -Sy --noconfirm > /dev/null 2>&1
+
+    pacman --config "$BUILD_DIR/archiso/pacman.conf" -Slq 2>/dev/null | sort -u > "$AVAILABLE_PKGS"
+
+    if [[ -d "$CUSTOMREPO_DIR" ]]; then
+        for f in "$CUSTOMREPO_DIR"/*.pkg.tar.*; do
+            [[ -f "$f" ]] || continue
+            local fname
+            fname=$(basename "$f")
+            local pkgname
+            pkgname=$(echo "$fname" | rev | cut -d'-' -f4- | rev)
+            echo "$pkgname" >> "$AVAILABLE_PKGS"
+        done
+        sort -u -o "$AVAILABLE_PKGS" "$AVAILABLE_PKGS"
+    fi
+
+    local avail_count
+    avail_count=$(wc -l < "$AVAILABLE_PKGS")
+    echo "  Indexed $avail_count available packages across all repos"
+
+    local removed_count=0
+    while IFS= read -r line; do
+        if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
+            echo "$line" >> "$CLEANED_PKGS"
+            continue
+        fi
+        local pkg
+        pkg=$(echo "$line" | xargs)
+        [[ -z "$pkg" ]] && continue
+
+        if grep -qx "$pkg" "$AVAILABLE_PKGS" 2>/dev/null; then
+            echo "$pkg" >> "$CLEANED_PKGS"
+        else
+            echo "$pkg" >> "$REMOVED_PKGS"
+            echo -e "    ${RED}✗${NC} $pkg"
+            ((removed_count++)) || true
+        fi
+    done < "$PKG_FILE"
+
+    if [[ $removed_count -gt 0 ]]; then
+        cp "$CLEANED_PKGS" "$PKG_FILE"
+        cp "$REMOVED_PKGS" "$HOME/arxos-removed-packages-$(date +%Y%m%d).txt"
+        echo -e "  ${YELLOW}⚠${NC} Removed $removed_count unavailable packages"
+        echo "  Full list saved to: ~/arxos-removed-packages-$(date +%Y%m%d).txt"
+    else
+        echo -e "  ${GREEN}✓${NC} All packages validated — none removed"
+    fi
+
+    rm -f "$AVAILABLE_PKGS" "$CLEANED_PKGS" "$REMOVED_PKGS"
+}
+
+###############################################################################
+# Sanity Checks
+###############################################################################
+log_step "Pre-flight Checks"
+
+if [ "$EUID" -eq 0 ]; then
+    log_error "Do not run this script as root!"
+    exit 1
+fi
+
+for tool in git pacman mkarchiso; do
+    if ! command -v $tool &>/dev/null; then
+        log_error "$tool is not installed"
+        exit 1
+    fi
+done
+log_info "Required tools present"
+
+if [ ! -f "$ARXOS_LOGO" ]; then
+    log_error "ArxOS logo not found at $ARXOS_LOGO"
+    exit 1
+fi
+log_info "ArxOS logo found"
+
+AVAILABLE_SPACE=$(df -BG ~ | awk 'NR==2 {print $4}' | tr -d 'G')
+if [ "$AVAILABLE_SPACE" -lt 50 ]; then
+    log_error "Insufficient disk space (need 50GB+, have ${AVAILABLE_SPACE}GB)"
+    exit 1
+fi
+log_info "Sufficient disk space: ${AVAILABLE_SPACE}GB available"
+
+if ! pacman -Qq archiso &>/dev/null; then
+    log_warn "archiso not installed - installing..."
+    sudo pacman -S --needed archiso
+fi
+log_info "archiso package installed"
+
+if [ ! -d "$WALLPAPER_DIR" ]; then
+    log_warn "Wallpaper directory not found at $WALLPAPER_DIR"
+else
+    WP_COUNT=$(find "$WALLPAPER_DIR" -type f | wc -l)
+    log_info "Wallpaper directory found: $WP_COUNT files"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Verify source-built Calamares exists (Qt6, no plasma-framework)
+# ═══════════════════════════════════════════════════════════════════════════════
+if [ ! -f "$CALAMARES_BIN" ]; then
+    log_error "Source-built Calamares binary not found at $CALAMARES_BIN"
+    echo ""
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}  Calamares 3.4.1 must be built from source first.${NC}"
+    echo -e "${YELLOW}  Run these commands:${NC}"
+    echo ""
+    echo -e "${YELLOW}    git clone https://codeberg.org/Calamares/calamares.git ~/calamares${NC}"
+    echo -e "${YELLOW}    cd ~/calamares && mkdir build && cd build${NC}"
+    echo -e "${YELLOW}    cmake -DCMAKE_BUILD_TYPE=Release ..${NC}"
+    echo -e "${YELLOW}    make -j\$(nproc)${NC}"
+    echo -e "${YELLOW}    sudo make install${NC}"
+    echo -e "${YELLOW}    sudo ldconfig${NC}"
+    echo ""
+    echo -e "${YELLOW}  Then re-run ./build${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    exit 1
+fi
+
+if [ ! -d "$CALAMARES_LIB/modules" ]; then
+    log_error "Calamares modules not found at $CALAMARES_LIB/modules"
+    echo "  Run 'sudo make install' in ~/calamares/build"
+    exit 1
+fi
+
+CALA_VERSION=$("$CALAMARES_BIN" --version 2>/dev/null | head -1 || echo "unknown")
+log_info "Source-built Calamares found: $CALA_VERSION (Qt6, no plasma-framework)"
+
+log_info "All pre-flight checks passed!"
+
+###############################################################################
+# Step 1: Clone ALCI Repository
+###############################################################################
+log_step "Step 1: Cloning ALCI Repository"
+
+if [ -d "$BUILD_DIR" ]; then
+    log_warn "Build directory exists - removing..."
+    rm -rf "$BUILD_DIR"
+fi
+
+git clone https://github.com/arch-linux-calamares-installer/alci-iso-lts.git "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+log_info "ALCI repository cloned"
+
+###############################################################################
+# Step 2: Configure ISO Metadata
+###############################################################################
+log_step "Step 2: Configuring ISO Metadata"
+
+cd archiso
+
+cat > profiledef.sh << 'PROFILEDEF'
+#!/usr/bin/env bash
+iso_name="arxos"
+iso_label="ARXOS"
+iso_publisher="ArxOS - v2026.2 ~ Mars"
+iso_application="ArxOS - v2026.2 ~ Mars"
+iso_version="v2026.2"
+install_dir="arch"
+buildmodes=('iso')
+bootmodes=('bios.syslinux.mbr' 'bios.syslinux.eltorito'
+           'uefi-ia32.grub.esp' 'uefi-x64.grub.esp'
+           'uefi-ia32.grub.eltorito' 'uefi-x64.grub.eltorito')
+arch="x86_64"
+pacman_conf="pacman.conf"
+airootfs_image_type="squashfs"
+airootfs_image_tool_options=('-comp' 'xz' '-Xbcj' 'x86' '-b' '1M' '-Xdict-size' '1M')
+file_permissions=(
+  ["/etc/shadow"]="0:0:400"
+  ["/root"]="0:0:750"
+  ["/root/.automated_script.sh"]="0:0:755"
+  ["/usr/local/bin/cpu-governor"]="0:0:755"
+  ["/usr/local/bin/myfastfetch"]="0:0:755"
+  ["/usr/local/bin/novabar"]="0:0:755"
+  ["/usr/local/bin/novadock"]="0:0:755"
+  ["/usr/local/bin/wallpimp"]="0:0:755"
+  ["/usr/local/bin/wir3G"]="0:0:755"
+  ["/usr/bin/calamares"]="0:0:755"
+)
+PROFILEDEF
+
+log_info "ISO metadata configured"
+
+###############################################################################
+# Step 3: Configure Repositories
+###############################################################################
+log_step "Step 3: Configuring Repositories"
+
+cp pacman.conf pacman.conf.backup
+
+cat > pacman.conf << PACMANCONF
+[options]
+HoldPkg     = pacman glibc
+Architecture = auto
+Color
+CheckSpace
+ParallelDownloads = 5
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+# customrepo — AUR packages
+[customrepo]
+SigLevel = Optional TrustedOnly
+Server = file://${CUSTOMREPO_DIR}
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+[blackarch]
+SigLevel = Optional TrustAll
+Server = https://www.mirrorservice.org/sites/blackarch.org/blackarch/\$repo/os/\$arch
+Server = https://mirror.yandex.ru/mirrors/blackarch/\$repo/os/\$arch
+Server = https://blackarch.mirror.garr.it/mirrors/blackarch/\$repo/os/\$arch
+PACMANCONF
+
+log_info "Repositories configured (core, extra, customrepo, blackarch)"
+
+###############################################################################
+# Step 4: Create Custom AUR Repository
+###############################################################################
+log_step "Step 4: Creating Custom AUR Repository"
+
+if [ -d "$CUSTOMREPO_DIR" ]; then
+    log_warn "Custom repo exists - removing..."
+    rm -rf "$CUSTOMREPO_DIR"
+fi
+
+mkdir -p "$CUSTOMREPO_DIR"
+
+YAY_CACHE="$HOME/.cache/yay"
+if [ -d "$YAY_CACHE" ]; then
+    log_info "Copying AUR packages from yay cache..."
+    find "$YAY_CACHE" -name "*.pkg.tar.zst" -exec cp {} "$CUSTOMREPO_DIR/" \;
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # FIX: No longer copying plasma-framework or calamares from cache!
+    # Source-built Calamares (Qt6) is injected directly into airootfs
+    # in Step 19. Only copy other needed AUR packages.
+    # ═══════════════════════════════════════════════════════════════════════
+    log_info "Copying additional cached packages..."
+    for pkg_pattern in "ckbcomp-" "blackarch-" "kpmcore-"; do
+        find /var/cache/pacman/pkg -name "${pkg_pattern}*.pkg.tar.zst" \
+            -exec cp -n {} "$CUSTOMREPO_DIR/" \; 2>/dev/null || true
+        find /var/cache/pacman/pkg -name "${pkg_pattern}*.pkg.tar.xz" \
+            -exec cp -n {} "$CUSTOMREPO_DIR/" \; 2>/dev/null || true
+    done
+
+    # Remove any old calamares AUR packages from yay cache
+    # (they have the broken plasma-framework dependency)
+    rm -f "$CUSTOMREPO_DIR"/calamares-3.3.* 2>/dev/null || true
+    log_info "Removed stale Qt5 calamares packages from customrepo (if any)"
+
+    # Build repo database
+    cd "$CUSTOMREPO_DIR"
+    repo-add customrepo.db.tar.gz *.pkg.tar.* 2>/dev/null || true
+
+    PKG_COUNT=$(ls -1 *.pkg.tar.* 2>/dev/null | wc -l)
+    log_info "Custom AUR repository created: $PKG_COUNT packages"
+else
+    log_warn "Yay cache not found - creating empty custom repo"
+    cd "$CUSTOMREPO_DIR"
+    repo-add customrepo.db.tar.gz
+fi
+
+cd "$BUILD_DIR/archiso"
+
+###############################################################################
+# Step 5: Generate Package List
+###############################################################################
+log_step "Step 5: Generating Package List"
+
+log_info "Capturing all installed packages..."
+pacman -Qq > packages.x86_64
+
+TOTAL_PKGS=$(wc -l < packages.x86_64)
+log_info "Captured $TOTAL_PKGS packages"
+
+# Remove lib32-* packages
+log_info "Removing lib32-* packages..."
+sed -i '/^lib32-/d' packages.x86_64
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX: Remove AUR calamares (Qt5) AND plasma-framework from package list.
+# Calamares is now source-built (Qt6) and injected directly into airootfs.
+# plasma-framework is no longer needed AT ALL.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Removing problematic and deprecated packages..."
+
+PROBLEMATIC_PACKAGES=(
+    # —— THE FIX: Remove AUR calamares (Qt5, broken plasma-framework dep) ——
+    calamares
+
+    # —— plasma-framework and ALL KF5 remnants ——
+    plasma-framework
+    plasma-framework5
+    plasma-wayland-session
+    plasma-wayland-protocols
+    plasma5-integration
+    plasma5-wallpapers-wallpaper-engine
+    kactivities
+    kactivities5
+    kactivities-stats
+    kactivities-stats5
+    kpeople
+    kpeople5
+    kxmlrpcclient
+    kxmlrpcclient5
+    kemoticons
+    kemoticons5
+    kjs
+    kjs5
+    kjsembed
+    kjsembed5
+    kdesignerplugin
+    kdesignerplugin5
+    kdewebkit
+    kdewebkit5
+    kdelibs4support
+    kdelibs4support5
+    kinit
+    kinit5
+    khtml
+    khtml5
+    kmediaplayer
+    kmediaplayer5
+    kross
+    kross5
+    kfloppy
+    khotkeys
+    kio-stash
+    kunitconversion5
+    kcontacts5
+    prison5
+    kpty5
+    kparts5
+    baloo5
+    kfilemetadata5
+    purpose5
+    kwallet5
+    kcalendarcore5
+    syndication5
+    kcolorpicker-qt5
+    poppler-qt5
+    polkit-qt5
+    qt5-xmlpatterns
+    qt5-virtualkeyboard
+    qt5-wayland
+
+    # —— Build-breaking (missing sources / broken) ——
+    arybo
+    osrframework
+    python-forkedsimhash-py
+    python-pytanque
+    neofetch
+
+    # —— Require lib32 deps ——
+    darkarmour
+    flare
+    limelighter
+    osslsigncode
+    rr
+    shed
+    thefatrat
+    trid
+    yinjector
+
+    # —— Telepathy stack (removed from repos entirely) ——
+    telepathy-gabble
+    telepathy-glib
+    telepathy-farstream
+    telepathy-haze
+    telepathy-idle
+    telepathy-kde-accounts-kcm
+    telepathy-kde-approver
+    telepathy-kde-auth-handler
+    telepathy-kde-call-ui
+    telepathy-kde-common-internals
+    telepathy-kde-contact-list
+    telepathy-kde-contact-runner
+    telepathy-kde-desktop-applets
+    telepathy-kde-filetransfer-handler
+    telepathy-kde-integration-module
+    telepathy-kde-send-file
+    telepathy-kde-text-ui
+    telepathy-logger
+    telepathy-mission-control
+    telepathy-qt
+    telepathy-rakia
+    telepathy-salut
+)
+
+REMOVED_PROB=0
+for pkg in "${PROBLEMATIC_PACKAGES[@]}"; do
+    if grep -qx "$pkg" packages.x86_64 2>/dev/null; then
+        sed -i "/^${pkg}$/d" packages.x86_64
+        echo -e "  ${YELLOW}⚠${NC} Removed: $pkg"
+        ((REMOVED_PROB++)) || true
+    fi
+done
+log_info "Removed $REMOVED_PROB problematic/deprecated packages"
+
+# Ensure essential packages
+log_info "Ensuring essential packages..."
+for pkg in base base-devel linux linux-firmware networkmanager sddm plank fastfetch; do
+    grep -q "^${pkg}$" packages.x86_64 || echo "$pkg" >> packages.x86_64
+done
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Calamares RUNTIME dependencies only (the binary itself is source-built).
+# These are what Calamares 3.4.1 (Qt6) actually links against.
+# NO plasma-framework. NO Qt5 packages.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Ensuring Calamares runtime dependencies (Qt6)..."
+for pkg in kpmcore boost-libs ckbcomp hwinfo mkinitcpio-openswap \
+           qt6-svg qt6-declarative qt6-5compat yaml-cpp \
+           libpwquality squashfs-tools kcoreaddons \
+           polkit-qt6 efibootmgr; do
+    grep -q "^${pkg}$" packages.x86_64 || echo "$pkg" >> packages.x86_64
+done
+
+# Sort and deduplicate
+sort -u packages.x86_64 -o packages.x86_64
+
+# Validate against live repos + customrepo
+log_info "Validating all packages against live repos + customrepo..."
+validate_package_list packages.x86_64
+
+FINAL_PKGS=$(wc -l < packages.x86_64)
+log_info "Final package count: $FINAL_PKGS packages"
+
+###############################################################################
+# Step 6: Copy System Binaries & Scripts
+###############################################################################
+log_step "Step 6: Copying Custom Scripts & Binaries"
+
+mkdir -p airootfs/usr/local/bin
+mkdir -p airootfs/etc/skel/.local/bin
+mkdir -p airootfs/etc/skel/bin
+
+if [ -d /usr/local/bin ]; then
+    log_info "Copying /usr/local/bin scripts..."
+    for script in cpu-governor myfastfetch novabar novadock wallpimp wir3G; do
+        if [ -f "/usr/local/bin/$script" ]; then
+            sudo cp "/usr/local/bin/$script" airootfs/usr/local/bin/
+            sudo chmod 755 "airootfs/usr/local/bin/$script"
+            log_info "  ✓ $script"
+        fi
+    done
+fi
+
+if [ -d ~/.local/bin ]; then
+    log_info "Copying ~/.local/bin scripts..."
+    for script in wallpimp wallpimp_daemon; do
+        if [ -f ~/.local/bin/$script ]; then
+            cp ~/.local/bin/$script airootfs/etc/skel/.local/bin/
+            chmod 755 "airootfs/etc/skel/.local/bin/$script"
+            log_info "  ✓ $script"
+        fi
+    done
+fi
+
+if [ -d ~/bin ]; then
+    log_info "Copying ~/bin scripts..."
+    for script in netspeed; do
+        if [ -f ~/bin/$script ]; then
+            cp ~/bin/$script airootfs/etc/skel/bin/
+            chmod 755 "airootfs/etc/skel/bin/$script"
+            log_info "  ✓ $script"
+        fi
+    done
+fi
+
+log_info "All custom scripts copied"
+
+###############################################################################
+# Step 7: Copy System Services
+###############################################################################
+log_step "Step 7: Copying Systemd Services"
+
+mkdir -p airootfs/etc/systemd/system
+
+if [ -d /etc/systemd/system ]; then
+    log_info "Copying custom systemd services..."
+    sudo cp -r /etc/systemd/system/*.service airootfs/etc/systemd/system/ 2>/dev/null || true
+    sudo cp -r /etc/systemd/system/*.target airootfs/etc/systemd/system/ 2>/dev/null || true
+    SERVICE_COUNT=$(find airootfs/etc/systemd/system -name "*.service" | wc -l)
+    log_info "Copied $SERVICE_COUNT custom services"
+fi
+
+mkdir -p airootfs/etc/systemd/system/multi-user.target.wants
+mkdir -p airootfs/etc/systemd/system/graphical.target.wants
+
+ln -sf /usr/lib/systemd/system/sddm.service \
+    airootfs/etc/systemd/system/display-manager.service
+
+ln -sf /usr/lib/systemd/system/NetworkManager.service \
+    airootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service
+
+log_info "Essential services enabled"
+
+###############################################################################
+# Step 8: Copy XFCE4 Desktop Configuration
+###############################################################################
+log_step "Step 8: Copying XFCE4 Desktop Configuration"
+
+mkdir -p airootfs/etc/skel/.config
+
+if [ -d ~/.config/xfce4 ]; then
+    log_info "Copying XFCE4 configuration..."
+    cp -r ~/.config/xfce4 airootfs/etc/skel/.config/
+    log_info "  ✓ Panel, desktop, xfwm4, shortcuts, session"
+fi
+
+if [ -d ~/.config/Thunar ]; then
+    log_info "Copying Thunar configuration..."
+    cp -r ~/.config/Thunar airootfs/etc/skel/.config/
+fi
+
+log_info "XFCE4 desktop configuration copied"
+
+###############################################################################
+# Step 9: Copy Plank Dock Configuration
+###############################################################################
+log_step "Step 9: Copying Plank Dock Configuration"
+
+if [ -d ~/.config/plank ]; then
+    log_info "Copying Plank dock configuration..."
+    cp -r ~/.config/plank airootfs/etc/skel/.config/
+fi
+
+if [ -d ~/.config/autostart ]; then
+    mkdir -p airootfs/etc/skel/.config/autostart
+    cp ~/.config/autostart/*.desktop airootfs/etc/skel/.config/autostart/ 2>/dev/null || true
+    log_info "Autostart applications copied"
+fi
+
+###############################################################################
+# Step 10: Copy GTK Themes & Appearance
+###############################################################################
+log_step "Step 10: Copying GTK Themes & Appearance"
+
+if [ -f ~/.config/gtk-3.0/settings.ini ]; then
+    log_info "Copying GTK 3.0 settings..."
+    mkdir -p airootfs/etc/skel/.config/gtk-3.0
+    cp ~/.config/gtk-3.0/settings.ini airootfs/etc/skel/.config/gtk-3.0/
+fi
+
+if [ -d ~/.themes ]; then
+    log_info "Copying custom themes..."
+    mkdir -p airootfs/etc/skel/.themes
+    cp -r ~/.themes/* airootfs/etc/skel/.themes/ 2>/dev/null || true
+    THEME_COUNT=$(ls -1 ~/.themes 2>/dev/null | wc -l)
+    log_info "  ✓ $THEME_COUNT themes (Reversal family)"
+fi
+
+###############################################################################
+# Step 11: Copy Terminal Configurations (COMPLETE)
+###############################################################################
+log_step "Step 11: Copying Terminal Configurations"
+
+# —— Konsole: ALL config locations ——
+
+if [ -f ~/.config/konsolerc ]; then
+    log_info "Copying konsolerc (main config)..."
+    cp ~/.config/konsolerc airootfs/etc/skel/.config/
+fi
+
+if [ -f ~/.config/konsolesshconfig ]; then
+    log_info "Copying Konsole SSH config..."
+    cp ~/.config/konsolesshconfig airootfs/etc/skel/.config/
+fi
+
+[ -f ~/.config/konsole.notifyrc ] && \
+    cp ~/.config/konsole.notifyrc airootfs/etc/skel/.config/
+
+if [ -d ~/.local/share/konsole ]; then
+    log_info "Copying Konsole profiles + color schemes..."
+    mkdir -p airootfs/etc/skel/.local/share/konsole
+    cp -r ~/.local/share/konsole/* airootfs/etc/skel/.local/share/konsole/
+    PROF=$(find ~/.local/share/konsole -maxdepth 1 -name "*.profile" 2>/dev/null | wc -l)
+    COLS=$(find ~/.local/share/konsole -maxdepth 1 -name "*.colorscheme" 2>/dev/null | wc -l)
+    KEYS=$(find ~/.local/share/konsole -maxdepth 1 -name "*.keytab" 2>/dev/null | wc -l)
+    log_info "  ✓ $PROF profile(s), $COLS color scheme(s), $KEYS keybinding(s)"
+fi
+
+if [ -d ~/.local/share/kxmlgui5/konsole ]; then
+    log_info "Copying Konsole toolbar/menu layout..."
+    mkdir -p airootfs/etc/skel/.local/share/kxmlgui5/konsole
+    cp -r ~/.local/share/kxmlgui5/konsole/* airootfs/etc/skel/.local/share/kxmlgui5/konsole/
+fi
+
+if [ -d ~/.local/share/color-schemes ]; then
+    log_info "Copying KDE color schemes (Catppuccin etc.)..."
+    mkdir -p airootfs/etc/skel/.local/share/color-schemes
+    cp -r ~/.local/share/color-schemes/* airootfs/etc/skel/.local/share/color-schemes/
+fi
+
+log_info "Konsole configuration complete"
+
+# —— Kitty ——
+if [ -d ~/.config/kitty ]; then
+    log_info "Copying Kitty configuration..."
+    cp -r ~/.config/kitty airootfs/etc/skel/.config/
+fi
+
+###############################################################################
+# Step 12: Copy Shell Configuration
+###############################################################################
+log_step "Step 12: Copying Shell Configuration"
+
+[ -f ~/.zshrc ] && { log_info "Copying .zshrc..."; cp ~/.zshrc airootfs/etc/skel/; }
+[ -d ~/.oh-my-zsh ] && { log_info "Copying Oh-My-Zsh..."; cp -r ~/.oh-my-zsh airootfs/etc/skel/; }
+[ -f ~/.bashrc ] && { log_info "Copying .bashrc..."; cp ~/.bashrc airootfs/etc/skel/; }
+
+log_info "Shell configurations copied"
+
+###############################################################################
+# Step 13: Copy Conky Configuration
+###############################################################################
+log_step "Step 13: Copying Conky Configuration"
+
+if [ -d ~/.config/conky ]; then
+    log_info "Copying Conky configuration..."
+    cp -r ~/.config/conky airootfs/etc/skel/.config/
+fi
+
+###############################################################################
+# Step 14: Copy Wallpapers + WallPimp Configuration
+###############################################################################
+log_step "Step 14: Copying Wallpapers + WallPimp"
+
+if [ -d "$WALLPAPER_DIR" ]; then
+    WALLPAPER_COUNT=$(find "$WALLPAPER_DIR" -type f \( \
+        -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o \
+        -name "*.gif" -o -name "*.bmp" -o -name "*.webp" \
+    \) 2>/dev/null | wc -l)
+    log_info "Found $WALLPAPER_COUNT wallpapers at $WALLPAPER_DIR"
+    log_info "Copying wallpapers (this will take a moment)..."
+
+    mkdir -p airootfs/usr/share/backgrounds/arxos
+    cp -r "$WALLPAPER_DIR"/* airootfs/usr/share/backgrounds/arxos/ 2>/dev/null || true
+
+    mkdir -p airootfs/etc/skel/Pictures
+    ln -sf /usr/share/backgrounds/arxos airootfs/etc/skel/Pictures/Wallpapers
+
+    log_info "Copied $WALLPAPER_COUNT wallpapers"
+
+    CURRENT_WALLPAPER=$(xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitoreDP-1/workspace0/last-image 2>/dev/null || echo "Unknown")
+    echo "  Current wallpaper: $(basename "$CURRENT_WALLPAPER")"
+else
+    log_warn "Wallpaper directory not found at $WALLPAPER_DIR — skipping"
+fi
+
+# —— WallPimp config for ISO ——
+log_info "Setting up WallPimp configuration..."
+mkdir -p airootfs/etc/skel/.config/wallpimp
+
+cat > airootfs/etc/skel/.config/wallpimp/config.json << 'WPCONFIG'
+{
+  "wallpaper_dir": "/usr/share/backgrounds/arxos",
+  "slideshow_interval": 300,
+  "download_workers": 8
+}
+WPCONFIG
+
+[ -f ~/.config/wallpimp/hashes.json ] && \
+    cp ~/.config/wallpimp/hashes.json airootfs/etc/skel/.config/wallpimp/
+
+mkdir -p airootfs/etc/skel/.config/systemd/user
+
+WALLPIMP_EXEC="/usr/local/bin/wallpimp"
+[ ! -f /usr/local/bin/wallpimp ] && [ -f ~/.local/bin/wallpimp ] && \
+    WALLPIMP_EXEC="\$HOME/.local/bin/wallpimp"
+
+cat > airootfs/etc/skel/.config/systemd/user/wallpimp-slideshow.service << EOF
+[Unit]
+Description=WallPimp Slideshow
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${WALLPIMP_EXEC} --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+log_info "  ✓ WallPimp config + systemd service installed"
+
+###############################################################################
+# Step 15: Copy Custom Fonts
+###############################################################################
+log_step "Step 15: Copying Custom Fonts"
+
+if [ -d ~/.local/share/fonts ] && [ "$(ls -A ~/.local/share/fonts 2>/dev/null)" ]; then
+    log_info "Copying custom fonts..."
+    mkdir -p airootfs/etc/skel/.local/share/fonts
+    cp -r ~/.local/share/fonts/* airootfs/etc/skel/.local/share/fonts/
+    FONT_COUNT=$(find ~/.local/share/fonts -type f | wc -l)
+    log_info "  ✓ $FONT_COUNT font files"
+fi
+
+###############################################################################
+# Step 16: Configure ArxOS Branding
+###############################################################################
+log_step "Step 16: Configuring ArxOS Branding"
+
+mkdir -p airootfs/etc
+cat > airootfs/etc/os-release << 'OSRELEASE'
+NAME="ArxOS"
+PRETTY_NAME="ArxOS v2026.2 ~ Mars"
+ID=arxos
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://thearxos.github.io"
+DOCUMENTATION_URL="https://github.com/thearxos/arxos"
+SUPPORT_URL="https://github.com/thearxos/arxos/issues"
+BUG_REPORT_URL="https://github.com/thearxos/arxos/issues"
+LOGO=arxos
+OSRELEASE
+
+log_info "ArxOS system identification configured"
+
+cat > airootfs/etc/motd << 'MOTD'
+
+    ╔═══════════════════════════════════════════════════════╗
+    ║                                                       ║
+    ║              Welcome to ArxOS v2026.2                 ║
+    ║                     ~ Mars ~                          ║
+    ║                                                       ║
+    ║    Website: https://thearxos.github.io               ║
+    ║    GitHub:  https://github.com/thearxos              ║
+    ║                                                       ║
+    ╚═══════════════════════════════════════════════════════╝
+
+MOTD
+
+log_info "Login banner configured"
+
+###############################################################################
+# Step 17: Configure SDDM Display Manager
+###############################################################################
+log_step "Step 17: Configuring SDDM Display Manager"
+
+mkdir -p airootfs/etc/sddm.conf.d
+cat > airootfs/etc/sddm.conf.d/arxos.conf << 'SDDMCONF'
+[Theme]
+Current=silent
+
+[General]
+DisplayServer=wayland-preferred
+
+[Users]
+MaximumUid=60513
+MinimumUid=1000
+
+[Wayland]
+SessionDir=/usr/share/wayland-sessions
+
+[X11]
+SessionDir=/usr/share/xsessions
+SDDMCONF
+
+log_info "SDDM configured with 'silent' theme"
+
+mkdir -p airootfs/usr/share/pixmaps
+cp "$ARXOS_LOGO" airootfs/usr/share/pixmaps/arxos.png
+log_info "ArxOS logo installed"
+
+###############################################################################
+# Step 18: Configure GRUB Bootloader
+###############################################################################
+log_step "Step 18: Configuring GRUB Bootloader"
+
+mkdir -p airootfs/etc/default
+cat > airootfs/etc/default/grub << 'GRUBCONF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="ArxOS"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUB_BACKGROUND="/usr/share/pixmaps/arxos.png"
+GRUB_COLOR_NORMAL="light-gray/black"
+GRUB_COLOR_HIGHLIGHT="green/black"
+GRUBCONF
+
+mkdir -p airootfs/boot/grub
+cp "$ARXOS_LOGO" airootfs/boot/grub/arxos.png
+log_info "GRUB configured with ArxOS branding"
+
+###############################################################################
+# Step 19: Install Source-Built Calamares + Configure
+###############################################################################
+log_step "Step 19: Installing Source-Built Calamares 3.4.1 (Qt6)"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE KEY FIX:
+# Instead of installing 'calamares' from AUR (Qt5, depends on the removed
+# plasma-framework package), we copy the source-built Calamares 3.4.1 (Qt6)
+# binary and modules directly into the ISO's filesystem.
+#
+# Source: https://codeberg.org/Calamares/calamares.git
+# Built with: cmake + make (Qt6, no plasma-framework dependency)
+# Installed to: /usr/{bin,lib,share}/calamares
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 19a. Copy Calamares binary
+log_info "Copying Calamares binary..."
+mkdir -p airootfs/usr/bin
+sudo cp "$CALAMARES_BIN" airootfs/usr/bin/calamares
+sudo chmod 755 airootfs/usr/bin/calamares
+log_info "  ✓ /usr/bin/calamares"
+
+# 19b. Copy Calamares shared libraries (libcalamares.so, libcalamaresui.so)
+log_info "Copying Calamares shared libraries..."
+mkdir -p airootfs/usr/lib
+for lib in /usr/lib/libcalamares.so* /usr/lib/libcalamaresui.so*; do
+    if [ -e "$lib" ]; then
+        sudo cp -a "$lib" airootfs/usr/lib/
+    fi
+done
+log_info "  ✓ libcalamares.so + libcalamaresui.so"
+
+# 19c. Copy Calamares modules (partition, bootloader, users, etc.)
+log_info "Copying Calamares modules..."
+mkdir -p airootfs/usr/lib/calamares
+sudo cp -r "$CALAMARES_LIB"/* airootfs/usr/lib/calamares/
+MODULE_COUNT=$(find airootfs/usr/lib/calamares/modules -maxdepth 1 -type d 2>/dev/null | wc -l)
+log_info "  ✓ $((MODULE_COUNT - 1)) modules copied to /usr/lib/calamares/"
+
+# 19d. Copy Calamares shared data (qml, branding templates, etc.)
+if [ -d "$CALAMARES_SHARE" ]; then
+    log_info "Copying Calamares shared data..."
+    mkdir -p airootfs/usr/share/calamares
+    sudo cp -r "$CALAMARES_SHARE"/* airootfs/usr/share/calamares/
+    log_info "  ✓ /usr/share/calamares/"
+fi
+
+# 19e. Create Calamares settings.conf
+log_info "Creating Calamares settings.conf..."
+mkdir -p airootfs/etc/calamares
+
+cat > airootfs/etc/calamares/settings.conf << 'CALSETTINGS'
+# ArxOS Calamares Settings — Source-built 3.4.1 (Qt6)
+modules-search: [ "/usr/lib/calamares/modules" ]
+
+instances:
+- id:       arxos
+  module:   netinstall
+  config:   netinstall-arxos.conf
+
+sequence:
+- show:
+  - welcome
+  - locale
+  - keyboard
+  - partition
+  - users
+  - summary
+- exec:
+  - partition
+  - mount
+  - unpackfs
+  - machineid
+  - fstab
+  - locale
+  - keyboard
+  - localecfg
+  - luksbootkeyfile
+  - users
+  - displaymanager
+  - networkcfg
+  - hwclock
+  - services-systemd
+  - packages
+  - initcpiocfg
+  - initcpio
+  - grubcfg
+  - bootloader
+  - preservefiles
+  - umount
+- show:
+  - finished
+
+branding: arxos
+prompt-install: true
+dont-chroot: false
+oem-setup: false
+disable-cancel: false
+disable-cancel-during-exec: false
+CALSETTINGS
+
+log_info "  ✓ /etc/calamares/settings.conf"
+
+# 19f. Create ArxOS branding for Calamares
+log_info "Creating Calamares branding..."
+mkdir -p airootfs/etc/calamares/branding/arxos
+
+cat > airootfs/etc/calamares/branding/arxos/branding.desc << 'CALBRANDING'
+componentName: arxos
+
+strings:
+    productName:         ArxOS
+    shortProductName:    ArxOS
+    version:             v2026.2 ~ Mars
+    shortVersion:        v2026.2
+    versionedName:       ArxOS v2026.2
+    shortVersionedName:  ArxOS v2026.2
+    bootloaderEntryName: ArxOS
+    productUrl:          https://thearxos.github.io
+    supportUrl:          https://github.com/thearxos/arxos/issues
+    knownIssuesUrl:      https://github.com/thearxos/arxos/issues
+    releaseNotesUrl:     https://github.com/thearxos/arxos/releases
+
+images:
+    productLogo:         "arxos.png"
+    productIcon:         "arxos.png"
+    productWelcome:      "welcome.png"
+
+slideshow:               "show.qml"
+
+style:
+   sidebarBackground:    "#2d3748"
+   sidebarText:          "#ffffff"
+   sidebarTextSelect:    "#4fd1c5"
+CALBRANDING
+
+cp "$ARXOS_LOGO" airootfs/etc/calamares/branding/arxos/arxos.png
+cp "$ARXOS_LOGO" airootfs/etc/calamares/branding/arxos/welcome.png
+log_info "  ✓ ArxOS branding installed"
+
+# 19g. Create Calamares .desktop launcher
+log_info "Creating Calamares desktop launcher..."
+mkdir -p airootfs/usr/share/applications
+
+cat > airootfs/usr/share/applications/calamares.desktop << 'CALDESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Install ArxOS
+GenericName=System Installer
+Comment=Install ArxOS v2026.2 to disk
+Exec=pkexec /usr/bin/calamares -d
+Icon=arxos
+Terminal=false
+StartupNotify=true
+Categories=System;
+CALDESKTOP
+
+log_info "  ✓ calamares.desktop launcher"
+
+# 19h. Create polkit rule for Calamares (needs root for disk operations)
+log_info "Creating Calamares polkit rule..."
+mkdir -p airootfs/etc/polkit-1/rules.d
+
+cat > airootfs/etc/polkit-1/rules.d/49-nopasswd-calamares.rules << 'POLKIT'
+/* Allow members of the wheel group to run Calamares without password */
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.policykit.exec") &&
+        action.lookup("program") == "/usr/bin/calamares" &&
+        subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+
+log_info "  ✓ polkit rule (wheel group, no password)"
+
+# 19i. Ensure Calamares libraries are in the library path
+log_info "Configuring library path for Calamares modules..."
+mkdir -p airootfs/etc/ld.so.conf.d
+echo "/usr/lib/calamares" > airootfs/etc/ld.so.conf.d/calamares.conf
+log_info "  ✓ /etc/ld.so.conf.d/calamares.conf"
+
+log_info "Source-built Calamares 3.4.1 (Qt6) installation complete!"
+echo -e "  ${GREEN}No plasma-framework dependency — permanent fix applied${NC}"
+
+###############################################################################
+# Step 20: Sanitize User Data
+###############################################################################
+log_step "Step 20: Sanitizing Personal Data"
+
+log_info "Removing personal information from configs..."
+find airootfs/etc/skel -type f -exec sed -i "s|/home/oxbx1|/home/CHANGEME|g" {} \; 2>/dev/null || true
+find airootfs/etc/skel -type f -exec sed -i "s|oxbx1|CHANGEME|g" {} \; 2>/dev/null || true
+
+log_info "Personal data sanitized"
+
+###############################################################################
+# Step 21: Set Permissions
+###############################################################################
+log_step "Step 21: Setting File Permissions"
+
+sudo chown -R root:root airootfs/usr/local/bin/* 2>/dev/null || true
+sudo chown -R root:root airootfs/usr/lib/calamares 2>/dev/null || true
+sudo chown -R root:root airootfs/usr/share/calamares 2>/dev/null || true
+sudo chown -R root:root airootfs/etc/systemd/system/* 2>/dev/null || true
+sudo chown -R root:root airootfs/etc/calamares 2>/dev/null || true
+sudo chown -R root:root airootfs/etc/polkit-1 2>/dev/null || true
+sudo chown -R 1000:1000 airootfs/etc/skel 2>/dev/null || true
+sudo chmod -R 755 airootfs/etc/skel/.local/bin/* 2>/dev/null || true
+sudo chmod -R 755 airootfs/etc/skel/bin/* 2>/dev/null || true
+sudo chmod 755 airootfs/usr/bin/calamares
+
+log_info "Permissions set"
+
+###############################################################################
+# Step 22: Build ISO
+###############################################################################
+log_step "Step 22: Building ISO (This will take 20-40 minutes)"
+
+if [ -d work ]; then
+    log_warn "Cleaning stale work directory..."
+    sudo rm -rf work
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+log_info "Starting mkarchiso..."
+echo ""
+echo -e "${YELLOW}Building ISO... Progress will be shown below${NC}"
+echo ""
+
+sudo mkarchiso -v -w work -o "$OUTPUT_DIR" .
+
+if [ $? -eq 0 ]; then
+    log_info "ISO build completed successfully!"
+else
+    log_error "ISO build failed!"
+    exit 1
+fi
+
+###############################################################################
+# Step 23: Final Summary
+###############################################################################
+log_step "Build Complete!"
+
+ISO_FILE=$(ls -t "$OUTPUT_DIR"/*.iso 2>/dev/null | head -1)
+
+if [ -f "$ISO_FILE" ]; then
+    ISO_SIZE=$(du -h "$ISO_FILE" | cut -f1)
+    ISO_BASENAME=$(basename "$ISO_FILE")
+    WALLPAPER_COUNT=$(find airootfs/usr/share/backgrounds/arxos -type f 2>/dev/null | wc -l)
+
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                                                              ║${NC}"
+    echo -e "${GREEN}║              ArxOS v2026.2 ~ Mars ISO Ready!                 ║${NC}"
+    echo -e "${GREEN}║                                                              ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${CYAN}ISO Details:${NC}"
+    echo "  • File: $ISO_BASENAME"
+    echo "  • Size: $ISO_SIZE"
+    echo "  • Location: $OUTPUT_DIR"
+    echo ""
+    echo -e "${CYAN}What's Included:${NC}"
+    echo "  ✓ XFCE4 Desktop Environment (4.20.2)"
+    echo "  ✓ SDDM Display Manager (silent theme)"
+    echo "  ✓ Plank Dock ($PLANK_LAUNCHERS custom launchers)"
+    echo "  ✓ 54 Reversal GTK Themes"
+    echo "  ✓ $FINAL_PKGS Packages"
+    echo "  ✓ $BLACKARCH_TOOLS BlackArch Security Tools"
+    echo "  ✓ $WALLPAPER_COUNT Wallpapers + WallPimp manager"
+    echo "  ✓ Custom Scripts + WallPimp slideshow"
+    echo "  ✓ Zsh + Oh-My-Zsh"
+    echo "  ✓ Konsole (full config) + Kitty"
+    echo "  ✓ Conky system monitor"
+    echo "  ✓ ArxOS branding throughout"
+    echo "  ✓ Calamares 3.4.1 graphical installer (Qt6, source-built)"
+    echo ""
+    echo -e "${CYAN}Next Steps:${NC}"
+    echo ""
+    echo "  1. Test in VM:"
+    echo "     qemu-system-x86_64 -enable-kvm -m 4G -cdrom \"$ISO_FILE\""
+    echo ""
+    echo "  2. Create bootable USB:"
+    echo "     sudo dd if=\"$ISO_FILE\" of=/dev/sdX bs=4M status=progress"
+    echo ""
+    echo "  3. Distribute:"
+    echo "     Upload to: https://github.com/thearxos/arxos/releases"
+    echo ""
+    echo -e "${GREEN}✓ ArxOS v2026.2 ~ Mars is ready for deployment!${NC}"
+    echo ""
+else
+    log_error "ISO file not found in $OUTPUT_DIR"
+    exit 1
+fi
