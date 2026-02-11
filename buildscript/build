@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ###############################################################################
 #                                                                             #
 #                    ArxOS v2026.2 ~ Mars ISO Builder                         #
@@ -458,6 +458,9 @@ PROBLEMATIC_PACKAGES=(
     qt5-virtualkeyboard
     qt5-wayland
 
+    # —— Conflicting packages (file conflicts with other packages) ——
+    python2-coloredlogs    # conflicts with python-coloredlogs over /usr/bin/coloredlogs
+
     # —— Build-breaking (missing sources / broken) ——
     arybo
     osrframework
@@ -597,6 +600,25 @@ if [ -d /etc/systemd/system ]; then
     sudo cp -r /etc/systemd/system/*.target airootfs/etc/systemd/system/ 2>/dev/null || true
     SERVICE_COUNT=$(find airootfs/etc/systemd/system -name "*.service" | wc -l)
     log_info "Copied $SERVICE_COUNT custom services"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FIX: Remove service files that ALSO exist inside packages.
+    # When mkarchiso installs libsdrplay/torctl, they try to place their
+    # .service files at the same paths we just copied → "conflicting files" error.
+    # Solution: delete them here so the packages can install them cleanly.
+    # ═══════════════════════════════════════════════════════════════════════════
+    log_info "Removing service files that conflict with package installations..."
+    CONFLICTING_SERVICES=(
+        "sdrplay.service"               # owned by libsdrplay package
+        "torctl-autostart.service"      # owned by torctl package
+        "torctl-autowipe.service"       # owned by torctl package
+    )
+    for svc in "${CONFLICTING_SERVICES[@]}"; do
+        if [ -f "airootfs/etc/systemd/system/$svc" ]; then
+            rm -f "airootfs/etc/systemd/system/$svc"
+            log_warn "Removed conflicting: $svc (will be installed by package)"
+        fi
+    done
 fi
 
 mkdir -p airootfs/etc/systemd/system/multi-user.target.wants
@@ -1130,12 +1152,58 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRE-BUILD: Final conflict sweep
+# Scan airootfs for files known to conflict with packages being installed.
+# This catches anything missed by earlier cleanup steps.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Running pre-build conflict sweep..."
+CONFLICT_FILES=(
+    "airootfs/etc/systemd/system/sdrplay.service"
+    "airootfs/etc/systemd/system/torctl-autostart.service"
+    "airootfs/etc/systemd/system/torctl-autowipe.service"
+    "airootfs/usr/bin/coloredlogs"
+)
+SWEEP_COUNT=0
+for cf in "${CONFLICT_FILES[@]}"; do
+    if [ -e "$cf" ]; then
+        rm -f "$cf"
+        log_warn "Pre-build sweep removed: $cf"
+        ((SWEEP_COUNT++)) || true
+    fi
+done
+if [ "$SWEEP_COUNT" -eq 0 ]; then
+    log_info "No conflicting files found — clean build"
+else
+    log_warn "Removed $SWEEP_COUNT conflicting files before build"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Create a pacman wrapper that passes --overwrite '*' as a safety net.
+# mkarchiso calls pacstrap internally, which uses pacman. By replacing
+# the pacman binary temporarily with a wrapper, we ensure any remaining
+# file conflicts are resolved by overwriting rather than failing.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Setting up pacman overwrite wrapper for build safety..."
+PACMAN_WRAPPER="/usr/local/bin/pacman-arxos-wrapper"
+sudo tee "$PACMAN_WRAPPER" > /dev/null << 'WRAPPER'
+#!/bin/bash
+# ArxOS build wrapper: injects --overwrite '*' into pacman calls
+# to prevent file conflict errors during ISO build
+exec /usr/bin/pacman --overwrite '*' "$@"
+WRAPPER
+sudo chmod 755 "$PACMAN_WRAPPER"
+
 log_info "Starting mkarchiso..."
 echo ""
 echo -e "${YELLOW}Building ISO... Progress will be shown below${NC}"
 echo ""
 
-sudo mkarchiso -v -w work -o "$OUTPUT_DIR" .
+# Run mkarchiso with PACMAN env var pointing to our wrapper
+sudo PACMAN="$PACMAN_WRAPPER" mkarchiso -v -w work -o "$OUTPUT_DIR" .
+
+# Clean up wrapper
+sudo rm -f "$PACMAN_WRAPPER"
 
 if [ $? -eq 0 ]; then
     log_info "ISO build completed successfully!"
