@@ -4,7 +4,7 @@
 #                    ArxOS v2026.2 ~ Mars ISO Builder                         #
 #                  Complete System Replica + ArxOS Branding                   #
 #                                                                             #
-#             Built for: 4rx0s (ArchBANG + BlackArch + XFCE4)                 #
+#             Built for: ArxOS (Arch base + arsenal + XFCE4)                 #
 #                                                                             #
 #  FIX: Uses SOURCE-BUILT Calamares 3.4.1 (Qt6) — no plasma-framework dep    #
 #       Binary copied directly from ~/calamares/build into ISO airootfs       #
@@ -54,7 +54,7 @@ DISPLAY_MANAGER="sddm"
 SDDM_THEME="silent"
 GTK_THEME="adw-gtk3-dark"
 PLANK_LAUNCHERS=7
-BLACKARCH_TOOLS=2840
+ARSENAL_TOOLS=2840
 
 echo -e "${MAGENTA}"
 cat << "EOF"
@@ -67,7 +67,7 @@ cat << "EOF"
 ║  • Display Manager: SDDM (silent theme)                      ║
 ║  • Dock: Plank (7 launchers)                                 ║
 ║  • Themes: 54 custom Reversal themes                         ║
-║  • BlackArch: 2,840 security tools                           ║
+║  • Arsenal:   2,840 security tools                           ║
 ║  • Calamares: Source-built 3.4.1 (Qt6)                       ║
 ║  • Custom Scripts: 9 tools + WallPimp                        ║
 ║                                                              ║
@@ -325,7 +325,7 @@ Server = https://mirror.yandex.ru/mirrors/blackarch/\$repo/os/\$arch
 Server = https://blackarch.mirror.garr.it/mirrors/blackarch/\$repo/os/\$arch
 PACMANCONF
 
-log_info "Repositories configured (core, extra, customrepo, blackarch)"
+log_info "Repositories configured (core, extra, customrepo, arsenal)"
 
 ###############################################################################
 # Step 4: Create Custom AUR Repository
@@ -1242,7 +1242,7 @@ if [ -f "$ISO_FILE" ]; then
     echo "  ✓ Plank Dock ($PLANK_LAUNCHERS custom launchers)"
     echo "  ✓ 54 Reversal GTK Themes"
     echo "  ✓ $FINAL_PKGS Packages"
-    echo "  ✓ $BLACKARCH_TOOLS BlackArch Security Tools"
+    echo "  ✓ $ARSENAL_TOOLS Arsenal Security Tools"
     echo "  ✓ $WALLPAPER_COUNT Wallpapers + WallPimp manager"
     echo "  ✓ Custom Scripts + WallPimp slideshow"
     echo "  ✓ Zsh + Oh-My-Zsh"
